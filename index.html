@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WanderQuest</title>
+<style>
+:root{--bg:#f3f7ef;--card:#fff;--ink:#1d2b1f;--ac:#2f7d4f}
+@media(prefers-color-scheme:dark){:root{--bg:#111a13;--card:#1b271e;--ink:#e5efe6;--ac:#5fcf8a}}
+body{margin:0 auto;max-width:560px;padding:20px;font-family:system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+.card{background:var(--card);border-radius:14px;padding:16px;margin:12px 0;box-shadow:0 1px 4px #0002}
+button,label.btn{display:block;width:100%;box-sizing:border-box;text-align:center;padding:12px;border:0;border-radius:10px;
+ background:var(--ac);color:#fff;font-size:1rem;font-weight:600;cursor:pointer;margin-top:10px}
+button:disabled{opacity:.5}
+.riddle{font-style:italic;white-space:pre-line;font-size:1.1rem;line-height:1.5}
+.dist{font-size:2rem;font-weight:700;color:var(--ac)}
+.hide{display:none}
+img{max-width:100%;border-radius:10px;margin-top:10px}
+.msg{margin-top:10px;font-size:.95rem}
+</style>
+</head>
+<body>
+<h1>🧭 WanderQuest</h1>
+
+<div id="s1" class="card">
+  <p>Turn your neighbourhood into a scavenger hunt. The screen is just your compass &mdash; the quest happens outside.</p>
+  <button id="start">Start My Quest</button>
+  <div id="err" class="msg"></div>
+</div>
+
+<div id="s2" class="card hide">
+  <div id="progress"></div>
+  <p class="riddle" id="riddle"></p>
+  <div>Distance: <span class="dist" id="dist">...</span></div>
+  <label class="btn" for="photo">📷 Snap a photo of it</label>
+  <input id="photo" type="file" accept="image/*" capture="environment" class="hide">
+  <img id="preview" class="hide" alt="your photo">
+  <div id="vision" class="msg"></div>
+  <button id="found" disabled>I found it!</button>
+  <div id="ferr" class="msg"></div>
+</div>
+
+<div id="s3" class="card hide">
+  <h2 id="title"></h2>
+  <div id="reveal"></div>
+  <button id="next">Next quest</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let hunt = null, idx = 0, pos = null, watchId = null, hasPhoto = false;
+const found = [];
+
+function show(id){ ["s1","s2","s3"].forEach(s => $(s).classList.toggle("hide", s !== id)); }
+
+function dist(a,b,c,d){
+  const R=6371000, r=Math.PI/180, dl=(c-a)*r, dn=(d-b)*r;
+  const x=Math.sin(dl/2)**2+Math.cos(a*r)*Math.cos(c*r)*Math.sin(dn/2)**2;
+  return 2*R*Math.asin(Math.sqrt(x));
+}
+
+function getPos(){
+  return new Promise((res, rej) => {
+    if (!navigator.geolocation) return rej(new Error("Geolocation not supported"));
+    navigator.geolocation.getCurrentPosition(res, e => rej(new Error(e.message)), {enableHighAccuracy:true, timeout:20000});
+  });
+}
+
+$("start").onclick = async () => {
+  $("err").textContent = ""; $("start").disabled = true; $("start").textContent = "Finding places & writing riddles...";
+  try {
+    const p = await getPos();
+    pos = {lat:p.coords.latitude, lon:p.coords.longitude};
+    const r = await fetch("/api/hunt", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(pos)});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "Something went wrong");
+    hunt = data; idx = 0; found.length = 0;
+    watchId = navigator.geolocation.watchPosition(
+      p => { pos = {lat:p.coords.latitude, lon:p.coords.longitude}; updateDist(); },
+      () => {}, {enableHighAccuracy:true, maximumAge:3000});
+    showQuest();
+  } catch (e) {
+    $("err").textContent = "Error: " + e.message;
+  } finally {
+    $("start").disabled = false; $("start").textContent = "Start My Quest";
+  }
+};
+
+function showQuest(){
+  const q = hunt.quests[idx];
+  hasPhoto = false;
+  $("progress").textContent = `Quest ${idx+1} of ${hunt.quests.length}`;
+  $("riddle").textContent = q.riddle;
+  $("preview").classList.add("hide"); $("vision").textContent = ""; $("ferr").textContent = "";
+  $("found").disabled = true; $("photo").value = "";
+  updateDist(); show("s2");
+}
+
+function updateDist(){
+  if (!hunt || !pos) return;
+  const q = hunt.quests[idx];
+  const d = Math.round(dist(pos.lat, pos.lon, q.lat, q.lon));
+  $("dist").textContent = d >= 1000 ? (d/1000).toFixed(2) + " km" : d + " m";
+}
+
+$("photo").onchange = async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  $("preview").src = url; $("preview").classList.remove("hide");
+  hasPhoto = true; $("found").disabled = false;
+  // Bonus: open-source vision model runs in the browser; the photo never leaves the phone.
+  $("vision").textContent = "Checking your photo on-device...";
+  try {
+    const { pipeline } = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3");
+    window.clf = window.clf || await pipeline("zero-shot-image-classification", "Xenova/clip-vit-base-patch32");
+    const kind = hunt.quests[idx].kind;
+    const labels = [`a photo of a ${kind}`, "a photo of a person", "a photo of an indoor room", "a photo of a screen"];
+    const out = await window.clf(url, labels);
+    const top = out.slice().sort((a,b) => b.score - a.score)[0];
+    $("vision").textContent = top.label === labels[0]
+      ? `✅ Looks like a ${kind}!` : `🤔 Not sure that's a ${kind}, but we'll trust your feet.`;
+  } catch (err) {
+    $("vision").textContent = "(On-device photo check unavailable, location will verify you.)";
+  }
+};
+
+$("found").onclick = async () => {
+  $("ferr").textContent = "";
+  try {
+    const p = await getPos();
+    pos = {lat:p.coords.latitude, lon:p.coords.longitude};
+    const q = hunt.quests[idx];
+    const r = await fetch(`/api/quest/${q.id}/found`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(pos)});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "Not there yet");
+    found.push(data.name);
+    $("title").textContent = "🎉 You found it!";
+    $("reveal").innerHTML = `<p>It was: <b></b> <small></small></p>`;
+    $("reveal").querySelector("b").textContent = data.name;
+    $("reveal").querySelector("small").textContent = data.name.toLowerCase() === data.kind.toLowerCase() ? "" : `(${data.kind})`;
+    $("next").textContent = idx + 1 < hunt.quests.length ? "Next quest" : "Finish";
+    show("s3");
+  } catch (e) {
+    $("ferr").textContent = e.message;
+  }
+};
+
+$("next").onclick = () => {
+  idx++;
+  if (idx < hunt.quests.length) return showQuest();
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  $("title").textContent = "🏆 Quest complete!";
+  $("reveal").innerHTML = "<p>You discovered:</p><ul></ul>";
+  found.forEach(n => { const li = document.createElement("li"); li.textContent = n; $("reveal").querySelector("ul").appendChild(li); });
+  $("next").textContent = "Start a new quest";
+  $("next").onclick = () => location.reload();
+};
+</script>
+</body>
+</html>
